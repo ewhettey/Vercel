@@ -139,6 +139,22 @@ CREATE POLICY "Admins and Pastors can manage events" ON public.events
     )
   );
 
+-- Public-safe view and policy for listing active events in the attendance form
+CREATE OR REPLACE VIEW public.public_active_events AS
+SELECT id, name, event_date, end_date, start_time, end_time, church, is_active
+FROM public.events
+WHERE is_active = true;
+
+-- Allow anyone (including anon) to view only active events
+DO $$ BEGIN
+  DROP POLICY IF EXISTS "Anyone can view active events via view" ON public.events;
+EXCEPTION WHEN undefined_object THEN
+  NULL;
+END $$;
+
+CREATE POLICY "Anyone can view active events via view" ON public.events
+  FOR SELECT USING (is_active = true);
+
 -- RLS Policies for Attendance table
 CREATE POLICY "Authenticated users can view attendance" ON public.attendance
   FOR SELECT USING (auth.role() = 'authenticated');
@@ -220,6 +236,67 @@ CREATE INDEX IF NOT EXISTS idx_events_date ON public.events(event_date);
 CREATE INDEX IF NOT EXISTS idx_attendance_event_phone ON public.attendance(event_id, phone);
 CREATE INDEX IF NOT EXISTS idx_attendance_event_id ON public.attendance(event_id);
 CREATE INDEX IF NOT EXISTS idx_attendance_date ON public.attendance(created_at);
+
+-- Secure RPC: lookup person by phone (minimal fields). Uses SECURITY DEFINER to bypass RLS safely.
+CREATE OR REPLACE FUNCTION public.lookup_person_by_phone(p_phone text)
+RETURNS TABLE(category text, name text, church text, how_heard text)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $fn$
+DECLARE
+  raw text := p_phone;
+  digits text := regexp_replace(p_phone, '\\D', '', 'g');
+BEGIN
+  -- Members (raw)
+  RETURN QUERY
+  SELECT 'Member', m.name, m.church, NULL::text
+  FROM public.members m
+  WHERE m.phone = raw
+  LIMIT 1;
+  IF FOUND THEN RETURN; END IF;
+
+  -- Members (digits)
+  IF digits IS NOT NULL AND digits <> raw THEN
+    RETURN QUERY
+    SELECT 'Member', m.name, m.church, NULL::text
+    FROM public.members m
+    WHERE m.phone = digits
+    LIMIT 1;
+    IF FOUND THEN RETURN; END IF;
+  END IF;
+
+  -- Visitors (raw)
+  RETURN QUERY
+  SELECT 'Visitor', v.name, v.church, v.how_heard
+  FROM public.visitors v
+  WHERE v.phone = raw
+  LIMIT 1;
+  IF FOUND THEN RETURN; END IF;
+
+  -- Visitors (digits)
+  IF digits IS NOT NULL AND digits <> raw THEN
+    RETURN QUERY
+    SELECT 'Visitor', v.name, v.church, v.how_heard
+    FROM public.visitors v
+    WHERE v.phone = digits
+    LIMIT 1;
+    IF FOUND THEN RETURN; END IF;
+  END IF;
+
+  -- Not found: return nothing
+  RETURN;
+END;
+$fn$;
+
+-- Grants: allow both anon and authenticated to execute
+GRANT EXECUTE ON FUNCTION public.lookup_person_by_phone(text) TO anon, authenticated;
+
+-- Convenience view: attendance with marked_by user's name
+CREATE OR REPLACE VIEW public.attendance_with_user AS
+SELECT a.*, u.name AS marked_by_name
+FROM public.attendance a
+LEFT JOIN public.users u ON u.id = a.marked_by;
 
 -- Create function to handle user creation
 CREATE OR REPLACE FUNCTION public.handle_new_user()

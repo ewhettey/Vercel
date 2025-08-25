@@ -26,22 +26,33 @@ const Reports = () => {
   const fetchReportsData = async () => {
     setLoading(true)
     try {
-      const today = new Date().toISOString().split('T')[0]
-      const weekStart = startOfWeek(new Date()).toISOString().split('T')[0]
-      const weekEnd = endOfWeek(new Date()).toISOString().split('T')[0]
+      const now = new Date()
+      const toISODate = (d) => d.toISOString().split('T')[0]
+      const startOfDayISO = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString()
+      const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n)
+
+      const today = toISODate(now)
+      const todayStartISO = startOfDayISO(now)
+      const tomorrowStartISO = startOfDayISO(addDays(now, 1))
+
+      const weekStartDate = startOfWeek(now)
+      const weekEndDate = endOfWeek(now)
+      const weekStartStartISO = startOfDayISO(weekStartDate)
+      const weekEndNextStartISO = startOfDayISO(addDays(weekEndDate, 1))
 
       // Fetch today's attendance
       const { data: todayData } = await supabase
-        .from('attendance')
+        .from('attendance_with_user')
         .select('*')
-        .eq('date', today)
+        .gte('created_at', todayStartISO)
+        .lt('created_at', tomorrowStartISO)
 
       // Fetch this week's attendance
       const { data: weekData } = await supabase
-        .from('attendance')
+        .from('attendance_with_user')
         .select('*')
-        .gte('date', weekStart)
-        .lte('date', weekEnd)
+        .gte('created_at', weekStartStartISO)
+        .lt('created_at', weekEndNextStartISO)
 
       // Calculate stats
       const membersToday = todayData?.filter(record => record.category === 'Member').length || 0
@@ -57,8 +68,11 @@ const Reports = () => {
       // Prepare weekly chart data
       const last7Days = Array.from({ length: 7 }, (_, i) => {
         const date = subDays(new Date(), 6 - i)
-        const dateStr = date.toISOString().split('T')[0]
-        const dayData = weekData?.filter(record => record.date === dateStr) || []
+        const dateStr = toISODate(date)
+        const dayData = (weekData || []).filter(record => {
+          const recDate = toISODate(new Date(record.created_at))
+          return recDate === dateStr
+        })
         
         return {
           date: format(date, 'MMM dd'),
@@ -79,15 +93,17 @@ const Reports = () => {
       setCategoryData(categoryStats)
 
       // Fetch attendance history based on date range
-      let query = supabase.from('attendance').select('*')
+      let query = supabase.from('attendance_with_user').select('*')
       
       if (dateRange === 'today') {
-        query = query.eq('date', today)
+        query = query.gte('created_at', todayStartISO).lt('created_at', tomorrowStartISO)
       } else if (dateRange === 'week') {
-        query = query.gte('date', weekStart).lte('date', weekEnd)
+        query = query.gte('created_at', weekStartStartISO).lt('created_at', weekEndNextStartISO)
       } else if (dateRange === 'month') {
-        const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0]
-        query = query.gte('date', monthStart)
+        const now2 = new Date()
+        const monthStartDate = new Date(now2.getFullYear(), now2.getMonth(), 1)
+        const monthStartISO = monthStartDate.toISOString()
+        query = query.gte('created_at', monthStartISO)
       }
 
       const { data: historyData } = await query.order('created_at', { ascending: false })
@@ -104,13 +120,13 @@ const Reports = () => {
     const csvContent = [
       ['Date', 'Name', 'Phone', 'Church', 'Category', 'How Heard', 'Marked By'],
       ...attendanceData.map(record => [
-        record.date,
+        format(new Date(record.created_at), 'yyyy-MM-dd'),
         record.name,
         record.phone,
         record.church,
         record.category,
         record.how_heard || '',
-        record.marked_by
+        record.marked_by_name || record.marked_by
       ])
     ].map(row => row.join(',')).join('\n')
 
@@ -305,10 +321,10 @@ const Reports = () => {
                     </span>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {format(new Date(record.date), 'MMM dd, yyyy')}
+                    {format(new Date(record.created_at), 'MMM dd, yyyy')}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {record.marked_by}
+                    {record.marked_by_name || record.marked_by}
                   </td>
                 </tr>
               ))}

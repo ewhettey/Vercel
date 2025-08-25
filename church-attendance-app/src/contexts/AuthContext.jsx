@@ -22,7 +22,8 @@ export const AuthProvider = ({ children }) => {
       const { data: { session } } = await supabase.auth.getSession()
       if (session?.user) {
         setUser(session.user)
-        await fetchUserProfile(session.user.id)
+        // Fetch profile in background; don't block UI
+        fetchUserProfile(session.user)
       }
       setLoading(false)
     }
@@ -34,7 +35,8 @@ export const AuthProvider = ({ children }) => {
       async (event, session) => {
         if (session?.user) {
           setUser(session.user)
-          await fetchUserProfile(session.user.id)
+          // Fetch profile in background; don't block UI
+          fetchUserProfile(session.user)
         } else {
           setUser(null)
           setUserProfile(null)
@@ -46,21 +48,35 @@ export const AuthProvider = ({ children }) => {
     return () => subscription.unsubscribe()
   }, [])
 
-  const fetchUserProfile = async (userId) => {
+  const fetchUserProfile = async (userObj) => {
     try {
       const { data, error } = await supabase
         .from('users')
         .select('*')
-        .eq('id', userId)
+        .eq('id', userObj.id)
         .single()
 
       if (error) {
-        console.error('Error fetching user profile:', error)
-        // If user profile doesn't exist, create a default one
+        // PGRST116 occurs when .single() finds 0 rows (406 Not Acceptable)
         if (error.code === 'PGRST116') {
-          console.log('User profile not found, will be created on first login')
+          // Create a default profile for this user
+          const defaultName = userObj.user_metadata?.name || userObj.email?.split('@')[0] || ''
+          const { data: inserted, error: upsertError } = await supabase
+            .from('users')
+            .upsert({ id: userObj.id, name: defaultName, email: userObj.email, role: 'Usher' })
+            .select()
+            .single()
+
+          if (upsertError) {
+            console.error('Error creating user profile:', upsertError)
+            return
+          }
+          setUserProfile(inserted)
+          return
+        } else {
+          console.error('Error fetching user profile:', error)
+          return
         }
-        return
       }
 
       setUserProfile(data)

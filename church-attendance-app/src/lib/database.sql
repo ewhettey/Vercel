@@ -11,6 +11,13 @@ CREATE TABLE IF NOT EXISTS public.users (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Ensure end_date exists for existing deployments
+DO $$ BEGIN
+  ALTER TABLE public.events ADD COLUMN IF NOT EXISTS end_date DATE;
+EXCEPTION WHEN duplicate_column THEN
+  NULL;
+END $$;
+
 -- Create Members table
 CREATE TABLE IF NOT EXISTS public.members (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -40,6 +47,7 @@ CREATE TABLE IF NOT EXISTS public.events (
   name TEXT NOT NULL,
   description TEXT,
   event_date DATE NOT NULL,
+  end_date DATE,
   start_time TIME,
   end_time TIME,
   church TEXT NOT NULL,
@@ -75,12 +83,25 @@ ALTER TABLE public.visitors ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.attendance ENABLE ROW LEVEL SECURITY;
 
+-- Prevent duplicate attendance for the same phone within the same event
+DO $$ BEGIN
+  ALTER TABLE public.attendance
+    ADD CONSTRAINT attendance_unique_event_phone UNIQUE (event_id, phone);
+EXCEPTION WHEN duplicate_object THEN
+  -- constraint already exists
+  NULL;
+END $$;
+
 -- RLS Policies for Users table
 CREATE POLICY "Users can view their own profile" ON public.users
   FOR SELECT USING (auth.uid() = id);
 
 CREATE POLICY "Users can update their own profile" ON public.users
   FOR UPDATE USING (auth.uid() = id);
+
+-- Allow users to create their own profile on first login
+CREATE POLICY "Users can insert their own profile" ON public.users
+  FOR INSERT WITH CHECK (auth.uid() = id);
 
 -- RLS Policies for Members table
 CREATE POLICY "Authenticated users can view members" ON public.members
@@ -122,21 +143,83 @@ CREATE POLICY "Admins and Pastors can manage events" ON public.events
 CREATE POLICY "Authenticated users can view attendance" ON public.attendance
   FOR SELECT USING (auth.role() = 'authenticated');
 
-CREATE POLICY "Ushers and Admins can mark attendance" ON public.attendance
+-- Restrict marking attendance to active events that have started (AND correct roles)
+DO $$ BEGIN
+  DROP POLICY IF EXISTS "Ushers and Admins can mark attendance" ON public.attendance;
+  DROP POLICY IF EXISTS "Mark attendance from 2h before start" ON public.attendance;
+EXCEPTION WHEN undefined_object THEN
+  NULL;
+END $$;
+
+CREATE POLICY "Mark attendance in 2h window" ON public.attendance
   FOR INSERT WITH CHECK (
+    -- role check
     EXISTS (
       SELECT 1 FROM public.users 
       WHERE users.id = auth.uid() AND users.role IN ('Admin', 'Usher')
     )
+    AND
+    -- event is active and within window (supports overnight end)
+    EXISTS (
+      SELECT 1 FROM public.events e
+      WHERE e.id = event_id
+        AND e.is_active = true
+        AND (
+          -- If no start time, allow on any date between event_date and end_date (inclusive)
+          (
+            e.start_time IS NULL AND CURRENT_DATE BETWEEN e.event_date AND COALESCE(e.end_date, e.event_date)
+          )
+          OR (
+            -- Compute timestamp window across midnight using proper casting
+            NOW() >= (
+              e.event_date::timestamp
+              + (e.start_time::interval)
+              - INTERVAL '2 hours'
+            )
+            AND
+            NOW() <= (
+              COALESCE(e.end_date, e.event_date)::timestamp
+              + (COALESCE(e.end_time, e.start_time)::interval)
+            )
+          )
+        )
+    )
   );
+
+-- Function to deactivate old events (over 30 days past end)
+CREATE OR REPLACE FUNCTION deactivate_old_events()
+RETURNS void AS $$
+BEGIN
+  UPDATE public.events 
+  SET is_active = false
+  WHERE is_active = true
+    AND (
+      -- For events with end_date and end_time
+      (end_date IS NOT NULL AND end_time IS NOT NULL AND 
+       (end_date::timestamp + end_time::interval) < NOW() - INTERVAL '30 days')
+      OR
+      -- For events with end_date but no end_time (all-day events ending on end_date)
+      (end_date IS NOT NULL AND end_time IS NULL AND 
+       end_date < CURRENT_DATE - INTERVAL '30 days')
+      OR
+      -- For events without end_date but with end_time
+      (end_date IS NULL AND end_time IS NOT NULL AND 
+       (event_date::timestamp + end_time::interval) < NOW() - INTERVAL '30 days')
+      OR
+      -- For events without end_date or end_time (all-day events ending on event_date)
+      (end_date IS NULL AND end_time IS NULL AND 
+       event_date < CURRENT_DATE - INTERVAL '30 days')
+    );
+END;
+$$ LANGUAGE plpgsql;
 
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_members_phone ON public.members(phone);
 CREATE INDEX IF NOT EXISTS idx_visitors_phone ON public.visitors(phone);
 CREATE INDEX IF NOT EXISTS idx_events_date ON public.events(event_date);
-CREATE INDEX IF NOT EXISTS idx_events_church ON public.events(church);
+CREATE INDEX IF NOT EXISTS idx_attendance_event_phone ON public.attendance(event_id, phone);
 CREATE INDEX IF NOT EXISTS idx_attendance_event_id ON public.attendance(event_id);
-CREATE INDEX IF NOT EXISTS idx_attendance_phone ON public.attendance(phone);
+CREATE INDEX IF NOT EXISTS idx_attendance_date ON public.attendance(created_at);
 
 -- Create function to handle user creation
 CREATE OR REPLACE FUNCTION public.handle_new_user()

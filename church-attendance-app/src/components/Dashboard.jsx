@@ -4,6 +4,7 @@ import { Users, UserPlus, BarChart3, LogOut, Calendar, Settings } from 'lucide-r
 import AttendanceForm from './AttendanceForm'
 import Reports from './Reports'
 import MemberManagement from './MemberManagement'
+import Events from './Events'
 
 const Dashboard = () => {
   const { user, userProfile, signOut } = useAuth()
@@ -18,6 +19,7 @@ const Dashboard = () => {
     
     if (role === 'Admin') {
       baseTabs.push(
+        { id: 'events', label: 'Events', icon: Calendar },
         { id: 'attendance', label: 'Attendance', icon: Calendar },
         { id: 'members', label: 'Members', icon: Users },
         { id: 'reports', label: 'Reports', icon: BarChart3 },
@@ -25,6 +27,7 @@ const Dashboard = () => {
       )
     } else if (role === 'Usher') {
       baseTabs.push(
+        { id: 'events', label: 'Events', icon: Calendar },
         { id: 'attendance', label: 'Attendance', icon: Calendar }
       )
     } else if (role === 'Pastor') {
@@ -40,6 +43,8 @@ const Dashboard = () => {
 
   const renderTabContent = () => {
     switch (activeTab) {
+      case 'events':
+        return <Events />
       case 'attendance':
         return <AttendanceForm />
       case 'members':

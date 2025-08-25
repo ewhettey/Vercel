@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { supabase } from '../lib/supabaseClient'
-import { Phone, User, MapPin, Users, CheckCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { Phone, User, MapPin, Users, CheckCircle, AlertCircle, Loader2, Calendar, Clock, Sparkles, Heart, Star } from 'lucide-react'
+import { withinWindow, getWindow } from '../lib/eventTime'
 
-const AttendanceForm = () => {
-  const { userProfile } = useAuth()
+const AttendanceForm = ({ eventId: providedEventId = '', eventName: providedEventName = '' }) => {
+  const { user, userProfile } = useAuth()
   const [formData, setFormData] = useState({
     phone: '',
     name: '',
@@ -16,20 +17,146 @@ const AttendanceForm = () => {
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [phoneSearching, setPhoneSearching] = useState(false)
+  const [events, setEvents] = useState([])
+  const [selectedEventId, setSelectedEventId] = useState(providedEventId || '')
+  const [eventsLoading, setEventsLoading] = useState(true)
+  const [eventsError, setEventsError] = useState('')
+  const phoneInputRef = useRef(null)
+  const [selectedEventInfo, setSelectedEventInfo] = useState(null)
+  const [eventStartError, setEventStartError] = useState('')
 
   const howHeardOptions = ['Friend', 'Social Media', 'Evangelism', 'Invitation', 'Other']
+
+  // Load upcoming/active events when no event is provided
+  useEffect(() => {
+    if (providedEventId) {
+      setSelectedEventId(providedEventId)
+      setEventsLoading(false)
+      return
+    }
+    const fetchEvents = async () => {
+      try {
+        setEventsLoading(true)
+        setEventsError('')
+        const now = new Date()
+        const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+        const yesterdayStr = yesterday.toISOString().slice(0, 10)
+        const { data, error } = await supabase
+          .from('events')
+          .select('id, name, event_date, start_time, end_time, church, is_active')
+          .eq('is_active', true)
+          .gte('event_date', yesterdayStr)
+          .order('event_date', { ascending: true })
+
+        if (error) throw error
+        // Filter to only events that have not yet ended (supports overnight)
+        const activeNotEnded = (data || []).filter(ev => {
+          try {
+            const [y, m, d] = ev.event_date.split('-').map(Number)
+            if (!ev.start_time) {
+              // No start time: show only on the event date (whole day)
+              return now.getFullYear() === y && (now.getMonth()+1) === m && now.getDate() === d
+            }
+            const [sh, sm, ss] = (ev.start_time || '00:00:00').split(':').map(Number)
+            const start = new Date(y, (m-1), d, sh || 0, sm || 0, ss || 0, 0)
+            const endStr = ev.end_time || ev.start_time
+            const [eh, em, es] = (endStr || '00:00:00').split(':').map(Number)
+            let endBase = new Date(y, (m-1), d, eh || 0, em || 0, es || 0, 0)
+            if (ev.end_time && endBase < start) {
+              // Overnight event
+              endBase = new Date(endBase.getTime() + 24 * 60 * 60 * 1000)
+            }
+            const windowEnd = new Date(endBase.getTime() + 2 * 60 * 60 * 1000)
+            return now <= windowEnd
+          } catch {
+            return false
+          }
+        })
+        setEvents(activeNotEnded)
+      } catch (e) {
+        console.error('Error loading events:', e)
+        setEventsError('Failed to load events')
+      } finally {
+        setEventsLoading(false)
+      }
+    }
+    fetchEvents()
+  }, [providedEventId])
+
+  // Load details for the selected event to determine if it has started
+  useEffect(() => {
+    const loadSelectedEvent = async () => {
+      setEventStartError('')
+      setSelectedEventInfo(null)
+      if (!selectedEventId) return
+      try {
+        const { data, error } = await supabase
+          .from('events')
+          .select('id, name, event_date, end_date, start_time, end_time, is_active')
+          .eq('id', selectedEventId)
+          .single()
+        if (error) throw error
+        setSelectedEventInfo(data)
+
+        // Use shared util to determine window and allowability
+        const allowed = withinWindow(data)
+
+        if (!data.is_active) {
+          setEventStartError('This event is inactive')
+        } else if (!allowed) {
+          const { windowStart, windowEnd } = getWindow(data)
+          if (windowStart && windowEnd) {
+            const fmt = (d)=> new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', hour12: true }).format(d)
+            const dateStr = new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'short', day: 'numeric' }).format(windowStart)
+            setEventStartError(`You can only mark attendance on ${dateStr} from ${fmt(windowStart)} until ${fmt(windowEnd)}`)
+          } else {
+            setEventStartError('You can only mark attendance on the event date')
+          }
+        } else {
+          setEventStartError('')
+        }
+      } catch (e) {
+        console.error('Error loading selected event details:', e)
+        setEventStartError('Could not verify event start time')
+      }
+    }
+    loadSelectedEvent()
+  }, [selectedEventId])
 
   // Auto-fill logic when phone number changes
   useEffect(() => {
     const searchByPhone = async () => {
-      if (formData.phone.length >= 10) {
+      if (formData.phone.length >= 7) {
         setPhoneSearching(true)
         try {
+          const rawPhone = formData.phone
+          const digitsPhone = formData.phone.replace(/\D/g, '')
+          const tryVisitors = async () => {
+            // Then check visitors table
+            const { data: visitorData, error: visitorError } = await supabase
+              .from('visitors')
+              .select('*')
+              .eq('phone', rawPhone)
+              .single()
+
+            if (visitorData && !visitorError) return { visitorData }
+
+            if (digitsPhone && digitsPhone !== rawPhone) {
+              const { data: visitorData2, error: visitorError2 } = await supabase
+                .from('visitors')
+                .select('*')
+                .eq('phone', digitsPhone)
+                .single()
+              if (visitorData2 && !visitorError2) return { visitorData: visitorData2 }
+            }
+            return {}
+          }
+
           // First check members table
           const { data: memberData, error: memberError } = await supabase
             .from('members')
             .select('*')
-            .eq('phone', formData.phone)
+            .eq('phone', rawPhone)
             .single()
 
           if (memberData && !memberError) {
@@ -44,14 +171,30 @@ const AttendanceForm = () => {
             return
           }
 
-          // Then check visitors table
-          const { data: visitorData, error: visitorError } = await supabase
-            .from('visitors')
-            .select('*')
-            .eq('phone', formData.phone)
-            .single()
+          // Try digits-only match for members
+          if (digitsPhone && digitsPhone !== rawPhone) {
+            const { data: memberData2, error: memberError2 } = await supabase
+              .from('members')
+              .select('*')
+              .eq('phone', digitsPhone)
+              .single()
+            if (memberData2 && !memberError2) {
+              setFormData(prev => ({
+                ...prev,
+                name: memberData2.name,
+                church: memberData2.church,
+                category: 'Member',
+                howHeard: ''
+              }))
+              setPhoneSearching(false)
+              return
+            }
+          }
 
-          if (visitorData && !visitorError) {
+          // Then check visitors table (raw then digits-only)
+          const { visitorData } = await tryVisitors()
+
+          if (visitorData) {
             setFormData(prev => ({
               ...prev,
               name: visitorData.name,
@@ -101,6 +244,12 @@ const AttendanceForm = () => {
         return
       }
 
+      if (!selectedEventId) {
+        setError('Please select an event')
+        setLoading(false)
+        return
+      }
+
       if (!formData.category) {
         setError('Please select Member or Visitor')
         setLoading(false)
@@ -113,16 +262,17 @@ const AttendanceForm = () => {
         return
       }
 
-      // Check if already marked attendance today
-      const today = new Date().toISOString().split('T')[0]
-      const { data: existingAttendance } = await supabase
+      // Check if already marked attendance for this event
+      const { data: existingAttendance, error: existingError } = await supabase
         .from('attendance')
-        .select('*')
+        .select('id')
         .eq('phone', formData.phone)
-        .eq('date', today)
+        .eq('event_id', selectedEventId)
+
+      if (existingError) throw existingError
 
       if (existingAttendance && existingAttendance.length > 0) {
-        setError('This person has already been marked present today')
+        setError('This number has already been marked present for this event')
         setLoading(false)
         return
       }
@@ -157,19 +307,28 @@ const AttendanceForm = () => {
       const { error: attendanceError } = await supabase
         .from('attendance')
         .insert({
+          event_id: selectedEventId,
           phone: formData.phone,
           name: formData.name,
           church: formData.church,
           how_heard: formData.howHeard || null,
           category: formData.category,
-          marked_by: userProfile?.email || 'Unknown'
+          marked_by: user?.id || null
         })
 
-      if (attendanceError) throw attendanceError
+      if (attendanceError) {
+        // Handle unique violation (duplicate per event_id + phone)
+        if (attendanceError.code === '23505') {
+          setError('This number has already been marked present for this event')
+          setLoading(false)
+          return
+        }
+        throw attendanceError
+      }
 
       setMessage(`✅ ${formData.name} marked present successfully!`)
       
-      // Reset form
+      // Reset form but keep selected event so multiple people can be checked in
       setFormData({
         phone: '',
         name: '',
@@ -177,6 +336,12 @@ const AttendanceForm = () => {
         howHeard: '',
         category: ''
       })
+      // Keep selected event to allow continuous check-ins
+
+      // Focus phone input for the next entry
+      if (phoneInputRef.current) {
+        phoneInputRef.current.focus()
+      }
 
       // Clear message after 3 seconds
       setTimeout(() => setMessage(''), 3000)
@@ -190,15 +355,8 @@ const AttendanceForm = () => {
   }
 
   return (
-    <div className="max-w-md mx-auto">
-      <div className="bg-white rounded-xl shadow-lg p-6">
-        <div className="text-center mb-6">
-          <div className="w-16 h-16 bg-primary-500 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Users className="w-8 h-8 text-white" />
-          </div>
-          <h2 className="text-2xl font-bold text-gray-900">Mark Attendance</h2>
-          <p className="text-gray-600 mt-2">Enter phone number to check in</p>
-        </div>
+    <div className="w-full sm:max-w-md sm:mx-auto">
+      <div className="bg-white rounded-lg shadow-lg p-6">
 
         {error && (
           <div className="bg-red-50 border border-red-200 text-red-600 px-4 py-3 rounded-lg mb-4 flex items-center">
@@ -215,6 +373,34 @@ const AttendanceForm = () => {
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Event Selection (only when no pre-selected event) */}
+          {!providedEventId && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Event *
+              </label>
+              <div className="relative">
+                <select
+                  name="event"
+                  value={selectedEventId}
+                  onChange={(e) => setSelectedEventId(e.target.value)}
+                  className="w-full py-3 px-3 text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                  required
+                  disabled={eventsLoading || (!!eventsError)}
+                >
+                  <option value="">{eventsLoading ? 'Loading events...' : 'Select an event'}</option>
+                  {events.map(ev => (
+                    <option key={ev.id} value={ev.id}>
+                      {ev.name} — {ev.event_date}
+                    </option>
+                  ))}
+                </select>
+                {eventsError && (
+                  <p className="mt-1 text-sm text-red-600">{eventsError}</p>
+                )}
+              </div>
+            </div>
+          )}
           {/* Phone Number */}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -227,7 +413,8 @@ const AttendanceForm = () => {
                 name="phone"
                 value={formData.phone}
                 onChange={handleInputChange}
-                className="w-full pl-10 pr-10 py-4 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                ref={phoneInputRef}
+                className="w-full pl-10 pr-10 py-3 text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                 placeholder="Enter phone number"
                 required
               />
@@ -249,7 +436,7 @@ const AttendanceForm = () => {
                 name="name"
                 value={formData.name}
                 onChange={handleInputChange}
-                className="w-full pl-10 pr-4 py-4 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                className="w-full pl-10 pr-4 py-3 text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                 placeholder="Enter full name"
                 required
               />
@@ -268,7 +455,7 @@ const AttendanceForm = () => {
                 name="church"
                 value={formData.church}
                 onChange={handleInputChange}
-                className="w-full pl-10 pr-4 py-4 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                className="w-full pl-10 pr-4 py-3 text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                 placeholder="Enter church name"
                 required
               />
@@ -284,7 +471,7 @@ const AttendanceForm = () => {
               <button
                 type="button"
                 onClick={() => setFormData(prev => ({ ...prev, category: 'Member' }))}
-                className={`py-3 px-4 rounded-lg border-2 font-medium transition-colors ${
+                className={`py-3 px-4 rounded-lg border-2 font-medium transition-colors text-base ${
                   formData.category === 'Member'
                     ? 'border-primary-500 bg-primary-50 text-primary-700'
                     : 'border-gray-300 text-gray-700 hover:border-gray-400'
@@ -295,7 +482,7 @@ const AttendanceForm = () => {
               <button
                 type="button"
                 onClick={() => setFormData(prev => ({ ...prev, category: 'Visitor' }))}
-                className={`py-3 px-4 rounded-lg border-2 font-medium transition-colors ${
+                className={`py-3 px-4 rounded-lg border-2 font-medium transition-colors text-base ${
                   formData.category === 'Visitor'
                     ? 'border-primary-500 bg-primary-50 text-primary-700'
                     : 'border-gray-300 text-gray-700 hover:border-gray-400'
@@ -316,7 +503,7 @@ const AttendanceForm = () => {
                 name="howHeard"
                 value={formData.howHeard}
                 onChange={handleInputChange}
-                className="w-full py-4 px-3 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                className="w-full py-3 px-3 text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                 required
               >
                 <option value="">Select an option</option>
@@ -327,11 +514,26 @@ const AttendanceForm = () => {
             </div>
           )}
 
+          {/* Event start restriction message */}
+          {eventStartError && (
+            <div className="bg-yellow-50 border border-yellow-200 text-yellow-700 px-4 py-2 rounded-lg text-sm">
+              {eventStartError}
+            </div>
+          )}
+
           {/* Submit Button */}
           <button
             type="submit"
-            disabled={loading || !formData.phone || !formData.name || !formData.church || !formData.category}
-            className="w-full bg-primary-500 hover:bg-primary-600 disabled:bg-gray-300 text-white font-semibold py-4 px-4 rounded-lg transition duration-200 flex items-center justify-center text-lg"
+            disabled={
+              loading ||
+              !selectedEventId ||
+              !formData.phone ||
+              !formData.name ||
+              !formData.church ||
+              !formData.category ||
+              !!eventStartError
+            }
+            className="w-full bg-primary-500 hover:bg-primary-600 disabled:bg-gray-300 text-white font-semibold py-3 px-4 rounded-lg transition duration-200 flex items-center justify-center text-base"
           >
             {loading ? (
               <Loader2 className="w-6 h-6 animate-spin" />
